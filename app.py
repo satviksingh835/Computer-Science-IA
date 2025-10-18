@@ -3,6 +3,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Class, Attendance
+from flask import jsonify
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -41,19 +42,32 @@ def register():
         email = request.form['email']
         password = request.form['password']
         role = request.form['role']
-        
-        user = User.query.filter_by(email=email).first()
-        if user:
-            flash('Email already exists')
+        print(f"[DEBUG] Register attempt: name={name}, email={email}, role={role}")
+
+        try:
+            user = User.query.filter_by(email=email).first()
+            if user:
+                if request.headers.get('Accept') == 'application/json':
+                    return jsonify({'error': 'Email already exists'}), 400
+                flash('Email already exists')
+                return redirect(url_for('register'))
+
+            new_user = User(name=name, email=email, password=generate_password_hash(password, method='sha256'), role=role)
+            db.session.add(new_user)
+            db.session.commit()
+
+            if request.headers.get('Accept') == 'application/json':
+                return jsonify({'message': 'Registration successful'}), 200
+
+            flash('Registration successful')
+            return redirect(url_for('login'))
+        except Exception as e:
+            print(f"[ERROR] Registration error: {e}")
+            if request.headers.get('Accept') == 'application/json':
+                return jsonify({'error': 'Server error'}), 500
+            flash('Server error')
             return redirect(url_for('register'))
-        
-        new_user = User(name=name, email=email, password=generate_password_hash(password, method='sha256'), role=role)
-        db.session.add(new_user)
-        db.session.commit()
-        
-        flash('Registration successful')
-        return redirect(url_for('login'))
-    
+
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -61,14 +75,25 @@ def login():
     if request.method == 'POST':
         email = request.form['email']
         password = request.form['password']
-        
-        user = User.query.filter_by(email=email).first()
-        if user and check_password_hash(user.password, password):
-            login_user(user)
-            return redirect(url_for('dashboard'))
-        else:
+        print(f"[DEBUG] Login attempt: email={email}")
+
+        try:
+            user = User.query.filter_by(email=email).first()
+            if user and check_password_hash(user.password, password):
+                login_user(user)
+                if request.headers.get('Accept') == 'application/json':
+                    return jsonify({'message': 'Login successful'}), 200
+                return redirect(url_for('dashboard'))
+
+            if request.headers.get('Accept') == 'application/json':
+                return jsonify({'error': 'Invalid email or password'}), 401
             flash('Invalid email or password')
-    
+        except Exception as e:
+            print(f"[ERROR] Login error: {e}")
+            if request.headers.get('Accept') == 'application/json':
+                return jsonify({'error': 'Server error'}), 500
+            flash('Server error')
+
     return render_template('login.html')
 
 @app.route('/logout')
@@ -85,6 +110,129 @@ def dashboard():
         return render_template('dashboard.html', classes=classes)
     else:
         return redirect(url_for('student_dashboard'))
+
+
+# --- API endpoints for React frontend ---
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+    return response
+
+
+@app.route('/api/classes')
+@login_required
+def api_classes():
+    # Returns classes for the current user (teacher sees their classes)
+    if current_user.role == 'teacher':
+        classes = Class.query.filter_by(teacher_id=current_user.id).all()
+    else:
+        classes = current_user.classes
+
+    result = []
+    for c in classes:
+        result.append({
+            'id': c.id,
+            'name': c.name,
+            'students': [{'id': s.id, 'name': s.name, 'email': s.email} for s in c.students]
+        })
+    return jsonify(result)
+
+
+@app.route('/api/student_dashboard')
+@login_required
+def api_student_dashboard():
+    if current_user.role != 'student':
+        return jsonify({'error': 'Only students'}), 403
+
+    classes = [{'id': c.id, 'name': c.name} for c in current_user.classes]
+    attendance_records = Attendance.query.filter_by(student_id=current_user.id).all()
+    records = [{'date': r.date.strftime('%Y-%m-%d'), 'class_name': r.class_.name, 'status': r.status} for r in attendance_records]
+
+    total = len(attendance_records)
+    present = sum(1 for r in attendance_records if r.status == 'present')
+    absent = total - present
+    rate = (present / total) * 100 if total > 0 else 0
+
+    return jsonify({
+        'classes': classes,
+        'attendance_records': records,
+        'stats': {'total': total, 'present': present, 'absent': absent, 'rate': rate}
+    })
+
+
+@app.route('/api/attendance_history/<int:class_id>')
+@login_required
+def api_attendance_history(class_id):
+    # Only teachers for this class or students in it should access — keep simple for demo
+    class_obj = Class.query.get_or_404(class_id)
+    attendance_records = Attendance.query.filter_by(class_id=class_id).all()
+
+    # aggregate per student
+    student_stats = []
+    for student in class_obj.students:
+        student_records = [r for r in attendance_records if r.student_id == student.id]
+        absent_count = sum(1 for r in student_records if r.status == 'absent')
+        present_count = sum(1 for r in student_records if r.status == 'present')
+        rate = (present_count / len(student_records) * 100) if student_records else 0
+        records = [{'date': r.date.strftime('%Y-%m-%d'), 'status': r.status} for r in student_records]
+        student_stats.append({
+            'id': student.id,
+            'name': student.name,
+            'absent_count': absent_count,
+            'present_count': present_count,
+            'attendance_rate': rate,
+            'records': records
+        })
+
+    return jsonify(student_stats)
+
+
+@app.route('/api/class/<int:class_id>')
+@login_required
+def api_class_detail(class_id):
+    class_obj = Class.query.get_or_404(class_id)
+    data = {
+        'id': class_obj.id,
+        'name': class_obj.name,
+        'students': [{'id': s.id, 'name': s.name, 'email': s.email} for s in class_obj.students]
+    }
+    return jsonify(data)
+
+
+@app.route('/api/mark_attendance/<int:class_id>', methods=['POST'])
+@login_required
+def api_mark_attendance(class_id):
+    # Expect JSON payload: { date: 'YYYY-MM-DD', records: [{student_id: x, status: 'present'|'absent'}] }
+    payload = request.get_json()
+    if not payload:
+        return jsonify({'error': 'Invalid JSON'}), 400
+
+    date_str = payload.get('date')
+    records = payload.get('records', [])
+    try:
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d') if date_str else datetime.today()
+    except Exception:
+        return jsonify({'error': 'Invalid date'}), 400
+
+    for r in records:
+        student_id = r.get('student_id')
+        status = r.get('status')
+        if student_id is None or status not in ('present', 'absent'):
+            continue
+        attendance = Attendance(class_id=class_id, student_id=student_id, status=status, attendance_date=date_obj)
+        db.session.add(attendance)
+
+    db.session.commit()
+    return jsonify({'message': 'Attendance saved'}), 200
+
+
+@app.route('/debug/session')
+def debug_session():
+    if current_user.is_authenticated:
+        return jsonify({'authenticated': True, 'user': {'id': current_user.id, 'email': current_user.email, 'name': current_user.name, 'role': current_user.role}})
+    return jsonify({'authenticated': False})
 
 
 class_stack = []
@@ -184,6 +332,17 @@ def add_student(class_id):
     return redirect(url_for('dashboard'))
 
 from collections import deque
+from threading import Thread
+import mailer
+import os
+try:
+    from redis import Redis
+    from rq import Queue
+    redis_conn = Redis(host=os.environ.get('REDIS_HOST','localhost'), port=int(os.environ.get('REDIS_PORT','6379')))
+    rq_queue = Queue('default', connection=redis_conn)
+except Exception:
+    redis_conn = None
+    rq_queue = None
 
 attendance_queue = deque()
 
@@ -217,44 +376,23 @@ def mark_attendance(class_id):
         
         db.session.commit()
         
-        # Send emails to absent students
+        # Send emails to absent students (do this asynchronously so request isn't blocked)
         for student in absent_students:
-            send_absence_email(student.email, class_obj.name, date_str)
+            try:
+                if rq_queue:
+                    # If RQ is configured, keep previous behavior (queue a job that will call mailer.send_email_sendgrid)
+                    rq_queue.enqueue('mailer.send_email_sendgrid', student.email, f"Absence Notification - {class_obj.name}", f"You were marked absent for {class_obj.name} on {date_str}.")
+                else:
+                    # Use the centralized simple SMTP mailer in a background thread to avoid blocking the request
+                    Thread(target=mailer.send_absence_email_simple, args=(student.email, class_obj.name, date_str), daemon=True).start()
+            except Exception as e:
+                app.logger.error(f"Failed to enqueue/send email for {student.email}: {e}")
         
         flash('Attendance marked successfully and absence emails sent')
         return redirect(url_for('dashboard'))
     
     return render_template('mark_attendance.html', class_obj=class_obj)
-def send_absence_email(student_email, class_name, date):
-    sender_email = "edunet657@gmail.com"  
-    sender_password = "yakb ysyg ogkm aoqz"  
-
-    message = MIMEMultipart()
-    message['From'] = sender_email
-    message['To'] = student_email
-    message['Subject'] = f"Absence Notification - {class_name}"
-
-    body = f"""
-    Dear Student,
-
-    This is to inform you that you were marked absent for the class {class_name} on {date}.
-
-    If you believe this is an error, please contact your teacher.
-
-    Best regards,
-    Attendance System
-    """
-
-    message.attach(MIMEText(body, 'plain'))
-
-    try:
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(message)
-        print(f"Absence email sent to {student_email}")
-    except Exception as e:
-        print(f"Failed to send email to {student_email}. Error: {str(e)}")
+# Email sending is handled by mailer.send_absence_email_simple in background threads when RQ is not configured.
 
 
 @app.route('/remove_student/<int:class_id>/<int:student_id>', methods=['POST'])
@@ -356,5 +494,5 @@ def export_class_attendance(class_id):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True)
+    app.run(debug=False, port=5001)
 
